@@ -1,9 +1,10 @@
 name: Grab TV Passport EPG
+
 on:
   schedule:
     # 每天 UTC 时间 0 点运行 (美东时间前一天晚上 8 点)
     - cron: '0 0 * * *'
-  workflow_dispatch: # 允许手动点击运行
+  workflow_dispatch: # 允许在 GitHub 网页端手动点击运行
 
 permissions:
   contents: write # 允许 Action 将抓取到的文件推送回仓库
@@ -28,7 +29,8 @@ jobs:
         working-directory: ./epg
 
       - name: Grab EPG (限制并发防封IP)
-        # 读取上一层目录的 tvpassport.channels.xml，输出 epg.xml，最大并发限制为2
+        # 即使抓取失败，也不要让这一步直接中断 Action，允许进入下一步进行判断
+        continue-on-error: true 
         run: npm run grab -- --channels=../tvpassport.channels.xml --output=../epg.xml --maxConnections=2 --days=3
         working-directory: ./epg
 
@@ -36,6 +38,18 @@ jobs:
         run: |
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add epg.xml
-          git diff-index --quiet HEAD || git commit -m "Auto update EPG"
-          git push
+          
+          # 判断当前目录下是否成功生成了 epg.xml 文件
+          if [ -f epg.xml ]; then
+            echo "抓取成功，正在提交 epg.xml..."
+            git add epg.xml
+            # 检测是否有文件变动，有变动才提交，防止重复提交
+            git diff-index --quiet HEAD || git commit -m "Auto update EPG"
+            git push
+            echo "提交完成！"
+          else
+            echo "⚠️ 警告: epg.xml 未生成！"
+            echo "原因可能是：1. tvpassport.channels.xml 文件名错误或不存在；2. GitHub IP 被 TV Passport (Cloudflare) 封禁返回 403。"
+            echo "请展开上一步 [Grab EPG] 的日志查看具体报错信息。"
+            exit 1
+          fi
