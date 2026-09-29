@@ -20,7 +20,7 @@ jobs:
         # -L 自动跟随重定向，-A 伪装成浏览器防止被墙或拦截，-o 指定保存的文件名
         run: |
           echo "开始从 OPEN-EPG 下载数据..."
-          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o epgextend.xml "https://www.open-epg.com/generate/ktW4mvWg8F.xml"
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o epgextend.xml "https://www.open-epg.com/generate/zYsq3cCPkY.xml"
 
       - name: Commit and push changes
         run: |
