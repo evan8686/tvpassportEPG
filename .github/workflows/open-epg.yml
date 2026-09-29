@@ -1,0 +1,41 @@
+name: Grab update from OPEN-EPG
+
+on:
+  schedule:
+    # UTC 0 点运行 = 完美对应北京时间早上 8 点
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许在网页端手动点击运行
+
+permissions:
+  contents: write # 允许 Action 将下载的文件推送回仓库
+
+jobs:
+  download-epg:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download EPG from OPEN-EPG
+        # -L 自动跟随重定向，-A 伪装成浏览器防止被墙或拦截，-o 指定保存的文件名
+        run: |
+          echo "开始从 OPEN-EPG 下载数据..."
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o epgextend.xml "https://www.open-epg.com/generate/ktW4mvWg8F.xml"
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 检查文件是否成功下载且大小大于 0
+          if [ -s epgextend.xml ]; then
+            echo "下载成功，准备提交 epgextend.xml"
+            git add epgextend.xml
+            # 如果文件内容和昨天有变化，就提交更新；如果没有变化，就跳过
+            git diff-index --quiet HEAD || git commit -m "Auto update Open-EPG extend"
+            git push
+            echo "提交完成！"
+          else
+            echo "⚠️ 警告: epgextend.xml 下载失败或文件为空！"
+            exit 1
+          fi
