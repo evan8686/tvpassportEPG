@@ -61,11 +61,11 @@ EOF
 
 echo "==> Starting WebGrab+Plus container"
 
-docker run -d \
-  --name "${CONTAINER}" \
+docker run --rm \
   --shm-size=1gb \
-  -v "${WORKDIR}:/config" \
-  "${IMAGE}" \
+  -v "$WORKDIR/config:/config" \
+  -v "$WORKDIR/output:/data" \
+  "$IMAGE"
   tail -f /dev/null
 
 echo "==> Generating TV Passport channel list (c2)"
