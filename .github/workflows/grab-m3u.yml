@@ -1,0 +1,50 @@
+name: Grab Custom M3U Subscriptions
+
+on:
+  schedule:
+    # UTC 时间 0, 6, 12, 18 分别对应北京时间 8:00, 14:00, 20:00, 02:00
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch: # 允许在网页端手动点击运行
+
+permissions:
+  contents: write # 允许 Action 将下载的文件推送回仓库
+
+jobs:
+  download-m3u:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Grab Yan-G M3U
+        # -L 自动跟随重定向，-A 伪装成浏览器，-o 指定输出文件名
+        run: |
+          echo "开始下载 Yan-G M3U..."
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o yanG.m3u "https://iptv.yang-1989.xyz/playlist.m3u"
+
+      - name: Grab GPT M3U
+        run: |
+          echo "开始下载 GPT M3U..."
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o GPT.m3u "https://iptv.852851.xyz/sub/JRTpy7FfgNKk/playlist.m3u"
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # 判断文件是否成功生成且大小大于 0 (-s 表示文件存在且非空)
+          if [ -s yanG.m3u ] || [ -s GPT.m3u ]; then
+            echo "下载成功，准备提交文件..."
+            
+            # 强制添加这两个文件，防止被 .gitignore 忽略
+            git add -f yanG.m3u GPT.m3u
+            
+            # 检测是否有文件变动，如果有变动才提交，防止没更新时重复提交
+            git diff-index --quiet HEAD || git commit -m "Auto update Yan-G and GPT M3U"
+            git push
+            echo "所有 M3U 文件提交完成！"
+          else
+            echo "⚠️ 警告: yanG.m3u 和 GPT.m3u 下载均失败或内容为空！"
+            echo "请检查原始订阅链接是否失效。"
+            exit 1
+          fi
