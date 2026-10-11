@@ -10,20 +10,286 @@ permissions:
 
 jobs:
   download-m3u:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install OpenVPN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openvpn
+          openvpn --version | head -n 1
+
+      - name: Prepare VPN Gate candidates
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/vpngate-candidates
+          chmod 700 /tmp/vpngate-candidates
+
+          python3 <<'PY'
+          import base64
+          import csv
+          import io
+          import ipaddress
+          import random
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          out = Path("/tmp/vpngate-candidates")
+          api = "https://www.vpngate.net/api/iphone/"
+
+          req = urllib.request.Request(
+              api,
+              headers={"User-Agent": "M3U-Updater/1.0"}
+          )
+
+          with urllib.request.urlopen(req, timeout=25) as response:
+              raw = response.read(8_000_000).decode(
+                  "utf-8", errors="replace"
+              )
+
+          lines = raw.splitlines()
+          header_index = next(
+              (i for i, line in enumerate(lines)
+               if line.startswith("#HostName,")),
+              None
+          )
+
+          if header_index is None:
+              raise SystemExit("VPN Gate API 未返回预期 CSV 表头")
+
+          header = next(csv.reader([lines[header_index]]))
+          header[0] = header[0].lstrip("#")
+
+          rows = csv.DictReader(
+              lines[header_index + 1:],
+              fieldnames=header
+          )
+
+          candidates = []
+
+          allowed_directives = {
+              "client", "dev", "proto", "resolv-retry",
+              "nobind", "persist-key", "persist-tun",
+              "remote-cert-tls", "verify-x509-name",
+              "auth", "cipher", "data-ciphers",
+              "data-ciphers-fallback", "tls-client",
+              "tls-version-min", "key-direction",
+              "verb", "mute", "sndbuf", "rcvbuf",
+              "tun-mtu", "explicit-exit-notify",
+              "keepalive", "ping", "ping-restart",
+              "ping-exit", "reneg-sec", "hand-window",
+              "tls-timeout", "connect-timeout",
+              "connect-retry", "connect-retry-max",
+              "server-poll-timeout", "float", "fast-io",
+              "auth-nocache"
+          }
+
+          allowed_blocks = {
+              "ca", "cert", "key", "tls-auth",
+              "tls-crypt", "dh", "extra-certs"
+          }
+
+          for row in rows:
+              try:
+                  ip = ipaddress.ip_address(row["IP"].strip())
+                  if ip.version != 4 or not ip.is_global:
+                      continue
+
+                  country = row.get("CountryShort", "").strip()
+                  if not country or country.upper() == "CN":
+                      continue
+
+                  encoded = row.get(
+                      "OpenVPN_ConfigData_Base64", ""
+                  ).strip()
+
+                  if not encoded:
+                      continue
+
+                  config = base64.b64decode(
+                      encoded, validate=True
+                  ).decode("utf-8", errors="replace")
+
+                  lines_in = config.splitlines()
+                  lines_out = []
+                  block = None
+                  remote_added = False
+                  cipher = None
+
+                  for line in lines_in:
+                      stripped = line.strip()
+
+                      if block:
+                          if stripped.lower() == f"</{block}>":
+                              lines_out.append(f"</{block}>")
+                              block = None
+                          else:
+                              lines_out.append(line)
+                          continue
+
+                      if stripped.startswith("#") or not stripped:
+                          continue
+
+                      match = re.fullmatch(
+                          r"<([A-Za-z0-9_-]+)>", stripped
+                      )
+                      if match:
+                          name = match.group(1).lower()
+                          if name in allowed_blocks:
+                              block = name
+                              lines_out.append(f"<{name}>")
+                          continue
+
+                      if stripped.startswith("<"):
+                          continue
+
+                      parts = stripped.split()
+                      directive = parts[0].lower()
+
+                      if directive == "remote":
+                          if remote_added or len(parts) < 3:
+                              continue
+                          try:
+                              port = int(parts[2])
+                              if not 1 <= port <= 65535:
+                                  continue
+                          except ValueError:
+                              continue
+
+                          lines_out.append(f"remote {ip} {port}")
+                          remote_added = True
+                          continue
+
+                      if directive == "auth-user-pass":
+                          lines_out.append(
+                              "auth-user-pass /tmp/vpngate-auth.txt"
+                          )
+                          continue
+
+                      if directive == "cipher" and len(parts) >= 2:
+                          cipher = parts[1]
+
+                      if directive in allowed_directives:
+                          lines_out.append(stripped)
+
+                  if block or not remote_added:
+                      continue
+
+                  if not any(
+                      line.startswith("client")
+                      for line in lines_out
+                  ):
+                      continue
+
+                  if not any(
+                      line.startswith("dev ")
+                      for line in lines_out
+                  ):
+                      continue
+
+                  if cipher and not any(
+                      line.startswith("data-ciphers-fallback ")
+                      for line in lines_out
+                  ):
+                      lines_out.append(
+                          f"data-ciphers-fallback {cipher}"
+                      )
+
+                  # Require CA material to validate the server.
+                  if "<ca>" not in lines_out:
+                      continue
+
+                  path = out / f"candidate-{len(candidates) + 1}.ovpn"
+                  path.write_text(
+                      "\n".join(lines_out) + "\n",
+                      encoding="utf-8"
+                  )
+                  path.chmod(0o600)
+
+                  candidates.append({
+                      "path": str(path),
+                      "country": country,
+                      "speed": int(row.get("Speed", "0") or 0)
+                  })
+
+              except Exception:
+                  continue
+
+          # Mix countries and try no more than 12 public relays.
+          candidates.sort(
+              key=lambda item: item["speed"], reverse=True
+          )
+          pool = candidates[:60]
+          random.shuffle(pool)
+
+          selected = []
+          countries = set()
+
+          for item in pool:
+              if item["country"] in countries:
+                  continue
+              selected.append(item)
+              countries.add(item["country"])
+              if len(selected) >= 12:
+                  break
+
+          # Fall back to additional nodes if the country pool is small.
+          if len(selected) < 5:
+              for item in pool:
+                  if item not in selected:
+                      selected.append(item)
+                  if len(selected) >= 12:
+                      break
+
+          for path in out.glob("candidate-*.ovpn"):
+              path.unlink()
+
+          for index, item in enumerate(selected, 1):
+              source = Path(item["path"])
+              target = out / f"candidate-{index}.ovpn"
+              # Recreate the chosen candidate after cleanup.
+              # The sanitized config is retained in memory below.
+              item["config"] = source.read_text(encoding="utf-8")
+              item["target"] = str(target)
+
+          # Re-fetch selected configs from their original temporary files
+          # is not possible after cleanup, so generate candidates directly
+          # from the retained sanitized text.
+          for index, item in enumerate(selected, 1):
+              Path(item["target"]).write_text(
+                  item["config"], encoding="utf-8"
+              )
+              Path(item["target"]).chmod(0o600)
+
+          if not selected:
+              raise SystemExit(
+                  "没有找到符合安全检查条件的 VPN Gate 节点"
+              )
+
+          Path("/tmp/vpngate-candidates/list.txt").write_text(
+              "\n".join(item["target"] for item in selected) + "\n",
+              encoding="utf-8"
+          )
+
+          print(f"已准备 {len(selected)} 个临时 VPN Gate 候选节点")
+          PY
+
+          printf 'vpn\nvpn\n' > /tmp/vpngate-auth.txt
+          chmod 600 /tmp/vpngate-auth.txt
+
       - name: Grab Yan-G M3U
         run: |
+          set -euo pipefail
+
           echo "开始下载 Yan-G M3U..."
 
-          curl -fLsS -L \
+          curl -fLsS \
             --connect-timeout 20 \
             --max-time 120 \
             --retry 2 \
@@ -33,46 +299,97 @@ jobs:
             "https://iptv.yang-1989.xyz/playlist.m3u"
 
           if ! head -c 100 yanG.m3u | grep -q '#EXTM3U'; then
-            echo "错误：Yan-G 下载结果不是有效的 M3U 文件"
+            echo "错误：Yan-G 返回的不是有效 M3U"
             exit 1
           fi
 
-          echo "Yan-G M3U 下载成功"
+          echo "Yan-G 下载成功"
 
-      - name: Grab GPT M3U
+      - name: Grab GPT M3U through VPN Gate
         run: |
+          set -uo pipefail
+
           URL="https://good.852851.xyz/sub/rvk5DMk5AD0B/playlist.m3u"
+          SUCCESS=0
+          INDEX=0
 
-          echo "开始下载 GPT M3U..."
+          while IFS= read -r CONFIG; do
+            [ -n "$CONFIG" ] || continue
+            INDEX=$((INDEX + 1))
 
-          curl -sS -L \
-            --connect-timeout 20 \
-            --max-time 120 \
-            --retry 2 \
-            --retry-delay 5 \
-            -A "VLC/3.0.21 LibVLC/3.0.21" \
-            -H "Accept: audio/x-mpegurl, audio/*, */*" \
-            -H "Accept-Language: en-US,en;q=0.9" \
-            -D gpt-headers.txt \
-            -o GPT.m3u \
-            -w '\nHTTP 状态码: %{http_code}\n最终 URL: %{url_effective}\n下载大小: %{size_download} bytes\n' \
-            "$URL" || true
+            LOG="/tmp/vpngate-${INDEX}.log"
+            TMP="/tmp/GPT-${INDEX}.m3u"
 
-          echo "===== GPT 响应头 ====="
-          cat gpt-headers.txt
+            echo "尝试 VPN Gate 节点 ${INDEX}..."
 
-          if [ ! -s GPT.m3u ] || ! head -c 100 GPT.m3u | grep -q '#EXTM3U'; then
-            echo "错误：GPT 下载失败或返回内容不是有效的 M3U 文件"
-            echo "文件开头："
-            head -c 500 GPT.m3u || true
-            echo
+            sudo timeout --signal=TERM 45s \
+              openvpn --config "$CONFIG" \
+              --auth-nocache --verb 3 >"$LOG" 2>&1 &
+            VPN_PID=$!
+
+            CONNECTED=0
+            for i in $(seq 1 30); do
+              if grep -q "Initialization Sequence Completed" "$LOG"; then
+                CONNECTED=1
+                break
+              fi
+
+              if ! kill -0 "$VPN_PID" 2>/dev/null; then
+                break
+              fi
+
+              sleep 1
+            done
+
+            if [ "$CONNECTED" -eq 1 ]; then
+              echo "VPN 隧道已建立，尝试下载..."
+
+              STATUS=$(curl -sS -L \
+                --connect-timeout 15 \
+                --max-time 90 \
+                -A "VLC/3.0.21 LibVLC/3.0.21" \
+                -H "Accept: audio/x-mpegurl, audio/*, */*" \
+                -o "$TMP" \
+                -w '%{http_code}' \
+                "$URL" || true)
+
+              if [ "$STATUS" = "200" ] &&
+                 [ -s "$TMP" ] &&
+                 head -c 100 "$TMP" | grep -q '#EXTM3U'; then
+                mv "$TMP" GPT.m3u
+                SUCCESS=1
+                echo "GPT M3U 下载成功"
+              else
+                echo "该节点下载失败，HTTP 状态码：${STATUS:-unknown}"
+              fi
+            else
+              echo "VPN 节点连接失败或超时"
+            fi
+
+            sudo kill -TERM "$VPN_PID" 2>/dev/null || true
+            wait "$VPN_PID" 2>/dev/null || true
+            sudo pkill -TERM -x openvpn 2>/dev/null || true
+
+            rm -f "$TMP"
+            sleep 2
+
+            if [ "$SUCCESS" -eq 1 ]; then
+              break
+            fi
+          done < /tmp/vpngate-candidates/list.txt
+
+          if [ "$SUCCESS" -ne 1 ]; then
+            echo "错误：所有 VPN Gate 候选节点均未能下载有效 GPT M3U"
             exit 1
           fi
 
-          echo "GPT M3U 下载成功"
+          rm -rf /tmp/vpngate-candidates
+          rm -f /tmp/vpngate-auth.txt /tmp/vpngate-*.log
 
       - name: Commit and push changes
         run: |
+          set -euo pipefail
+
           git config --local user.name "github-actions[bot]"
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
 
