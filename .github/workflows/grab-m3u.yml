@@ -25,28 +25,39 @@ jobs:
             -o yanG.m3u \
             "https://iptv.yang-1989.xyz/playlist.m3u"
 
+     
       - name: Grab GPT M3U
         run: |
-          echo "开始下载 GPT M3U..."
+          URL="https://good.852851.xyz/sub/rvk5DMk5AD0B/playlist.m3u"
 
-          curl -sS -L --compressed \
-            -A "OTT Navigator/1.7.0" \
-            -H "Accept: */*" \
+          echo "开始下载 GPT M3U..."
+          curl -sS -L \
+            --connect-timeout 20 \
+            --max-time 120 \
+            --retry 2 \
+            --retry-delay 5 \
+            -A "VLC/3.0.21 LibVLC/3.0.21" \
+            -H "Accept: audio/x-mpegurl, audio/*, */*" \
             -H "Accept-Language: en-US,en;q=0.9" \
             -D gpt-headers.txt \
             -o GPT.m3u \
-            -w "\nHTTP 状态码: %{http_code}\n最终 URL: %{url_effective}\n" \
-            "https://good.852851.xyz/sub/rvk5DMk5AD0B/playlist.m3u"
+            -w '\nHTTP 状态码: %{http_code}\n最终 URL: %{url_effective}\n下载大小: %{size_download} bytes\n' \
+            "$URL" || true
 
-          echo "响应头中的 Cloudflare 信息："
-          grep -iE '^(HTTP/|cf-ray:|cf-mitigated:|content-type:|location:)' gpt-headers.txt || true
+          echo "===== 响应头 ====="
+          cat gpt-headers.txt
 
-          echo "返回内容前 5 行："
-          head -n 5 GPT.m3u
+          echo "===== 文件类型 ====="
+          file GPT.m3u || true
 
-          if grep -qiE 'Attention Required!|Sorry, you have been blocked|cf-error-details' GPT.m3u; then
-            echo "::error::GPT 订阅仍然返回 Cloudflare 拦截页面"
-            exit 1
+          echo "===== 文件开头 ====="
+          head -c 500 GPT.m3u || true
+          echo
+
+          if [ -s GPT.m3u ] && head -c 100 GPT.m3u | grep -qiE '(^#EXTM3U|^#EXTINF)'; then
+            echo "检测到 M3U 内容"
+          else
+            echo "⚠️ 未检测到预期的 M3U 文件头"
           fi
 
       - name: Commit and push changes
