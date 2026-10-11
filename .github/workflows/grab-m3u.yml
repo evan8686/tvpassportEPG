@@ -23,6 +23,7 @@ jobs:
           sudo apt-get install -y openvpn
           openvpn --version | head -n 1
 
+     
       - name: Prepare VPN Gate candidates
         run: |
           set -euo pipefail
@@ -33,7 +34,6 @@ jobs:
           python3 <<'PY'
           import base64
           import csv
-          import io
           import ipaddress
           import random
           import re
@@ -43,20 +43,22 @@ jobs:
           out = Path("/tmp/vpngate-candidates")
           api = "https://www.vpngate.net/api/iphone/"
 
-          req = urllib.request.Request(
+          request = urllib.request.Request(
               api,
               headers={"User-Agent": "M3U-Updater/1.0"}
           )
 
-          with urllib.request.urlopen(req, timeout=25) as response:
+          with urllib.request.urlopen(request, timeout=25) as response:
               raw = response.read(8_000_000).decode(
                   "utf-8", errors="replace"
               )
 
           lines = raw.splitlines()
           header_index = next(
-              (i for i, line in enumerate(lines)
-               if line.startswith("#HostName,")),
+              (
+                  i for i, line in enumerate(lines)
+                  if line.startswith("#HostName,")
+              ),
               None
           )
 
@@ -70,8 +72,6 @@ jobs:
               lines[header_index + 1:],
               fieldnames=header
           )
-
-          candidates = []
 
           allowed_directives = {
               "client", "dev", "proto", "resolv-retry",
@@ -95,6 +95,8 @@ jobs:
               "tls-crypt", "dh", "extra-certs"
           }
 
+          candidates = []
+
           for row in rows:
               try:
                   ip = ipaddress.ip_address(row["IP"].strip())
@@ -116,34 +118,35 @@ jobs:
                       encoded, validate=True
                   ).decode("utf-8", errors="replace")
 
-                  lines_in = config.splitlines()
-                  lines_out = []
+                  result = []
                   block = None
                   remote_added = False
+                  auth_added = False
                   cipher = None
 
-                  for line in lines_in:
+                  for line in config.splitlines():
                       stripped = line.strip()
 
                       if block:
                           if stripped.lower() == f"</{block}>":
-                              lines_out.append(f"</{block}>")
+                              result.append(f"</{block}>")
                               block = None
                           else:
-                              lines_out.append(line)
+                              result.append(line)
                           continue
 
-                      if stripped.startswith("#") or not stripped:
+                      if not stripped or stripped.startswith("#"):
                           continue
 
                       match = re.fullmatch(
                           r"<([A-Za-z0-9_-]+)>", stripped
                       )
+
                       if match:
                           name = match.group(1).lower()
                           if name in allowed_blocks:
                               block = name
-                              lines_out.append(f"<{name}>")
+                              result.append(f"<{name}>")
                           continue
 
                       if stripped.startswith("<"):
@@ -155,76 +158,72 @@ jobs:
                       if directive == "remote":
                           if remote_added or len(parts) < 3:
                               continue
+
                           try:
                               port = int(parts[2])
-                              if not 1 <= port <= 65535:
-                                  continue
                           except ValueError:
                               continue
 
-                          lines_out.append(f"remote {ip} {port}")
+                          if not 1 <= port <= 65535:
+                              continue
+
+                          result.append(f"remote {ip} {port}")
                           remote_added = True
                           continue
 
                       if directive == "auth-user-pass":
-                          lines_out.append(
+                          result.append(
                               "auth-user-pass /tmp/vpngate-auth.txt"
                           )
+                          auth_added = True
                           continue
 
                       if directive == "cipher" and len(parts) >= 2:
                           cipher = parts[1]
 
                       if directive in allowed_directives:
-                          lines_out.append(stripped)
+                          result.append(stripped)
 
                   if block or not remote_added:
                       continue
 
-                  if not any(
-                      line.startswith("client")
-                      for line in lines_out
-                  ):
+                  if not any(x.startswith("client") for x in result):
                       continue
 
-                  if not any(
-                      line.startswith("dev ")
-                      for line in lines_out
-                  ):
+                  if not any(x.startswith("dev ") for x in result):
                       continue
+
+                  if "<ca>" not in result:
+                      continue
+
+                  if not auth_added:
+                      result.append(
+                          "auth-user-pass /tmp/vpngate-auth.txt"
+                      )
 
                   if cipher and not any(
-                      line.startswith("data-ciphers-fallback ")
-                      for line in lines_out
+                      x.startswith("data-ciphers-fallback ")
+                      for x in result
                   ):
-                      lines_out.append(
+                      result.append(
                           f"data-ciphers-fallback {cipher}"
                       )
 
-                  # Require CA material to validate the server.
-                  if "<ca>" not in lines_out:
-                      continue
-
-                  path = out / f"candidate-{len(candidates) + 1}.ovpn"
-                  path.write_text(
-                      "\n".join(lines_out) + "\n",
-                      encoding="utf-8"
-                  )
-                  path.chmod(0o600)
-
                   candidates.append({
-                      "path": str(path),
                       "country": country,
-                      "speed": int(row.get("Speed", "0") or 0)
+                      "speed": int(row.get("Speed", "0") or 0),
+                      "config": "\n".join(result) + "\n"
                   })
 
               except Exception:
                   continue
 
-          # Mix countries and try no more than 12 public relays.
           candidates.sort(
-              key=lambda item: item["speed"], reverse=True
+              key=lambda item: item["speed"],
+              reverse=True
           )
+
+          # 从速度较好的候选中随机挑选，优先分散国家。
           pool = candidates[:60]
           random.shuffle(pool)
 
@@ -234,54 +233,45 @@ jobs:
           for item in pool:
               if item["country"] in countries:
                   continue
+
               selected.append(item)
               countries.add(item["country"])
+
               if len(selected) >= 12:
                   break
 
-          # Fall back to additional nodes if the country pool is small.
           if len(selected) < 5:
               for item in pool:
                   if item not in selected:
                       selected.append(item)
+
                   if len(selected) >= 12:
                       break
 
-          for path in out.glob("candidate-*.ovpn"):
-              path.unlink()
-
-          for index, item in enumerate(selected, 1):
-              source = Path(item["path"])
-              target = out / f"candidate-{index}.ovpn"
-              # Recreate the chosen candidate after cleanup.
-              # The sanitized config is retained in memory below.
-              item["config"] = source.read_text(encoding="utf-8")
-              item["target"] = str(target)
-
-          # Re-fetch selected configs from their original temporary files
-          # is not possible after cleanup, so generate candidates directly
-          # from the retained sanitized text.
-          for index, item in enumerate(selected, 1):
-              Path(item["target"]).write_text(
-                  item["config"], encoding="utf-8"
-              )
-              Path(item["target"]).chmod(0o600)
-
           if not selected:
               raise SystemExit(
-                  "没有找到符合安全检查条件的 VPN Gate 节点"
+                  "未找到通过配置检查的 VPN Gate 节点"
               )
 
-          Path("/tmp/vpngate-candidates/list.txt").write_text(
-              "\n".join(item["target"] for item in selected) + "\n",
+          paths = []
+
+          for index, item in enumerate(selected, 1):
+              path = out / f"candidate-{index}.ovpn"
+              path.write_text(item["config"], encoding="utf-8")
+              path.chmod(0o600)
+              paths.append(str(path))
+
+          (out / "list.txt").write_text(
+              "\n".join(paths) + "\n",
               encoding="utf-8"
           )
 
-          print(f"已准备 {len(selected)} 个临时 VPN Gate 候选节点")
+          print(f"已准备 {len(paths)} 个 VPN Gate 候选节点")
           PY
 
           printf 'vpn\nvpn\n' > /tmp/vpngate-auth.txt
           chmod 600 /tmp/vpngate-auth.txt
+
 
       - name: Grab Yan-G M3U
         run: |
