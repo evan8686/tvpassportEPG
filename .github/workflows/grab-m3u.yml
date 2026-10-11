@@ -25,7 +25,7 @@ jobs:
       - name: Grab GPT M3U
         run: |
           echo "开始下载 GPT M3U..."
-          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o GPT.m3u "https://iptv.852851.xyz/sub/JRTpy7FfgNKk/playlist.m3u"
+          curl -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" -o GPT.m3u "https://good.852851.xyz/sub/rvk5DMk5AD0B/playlist.m3u"
 
       - name: Commit and push changes
         run: |
