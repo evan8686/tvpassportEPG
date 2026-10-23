@@ -299,7 +299,7 @@ jobs:
         run: |
           set -uo pipefail
 
-          URL="https://good.852851.xyz/sub/rvk5DMk5AD0B/playlist.m3u"
+          URL="https://iptv.851855.xyz/sub/Zz0uFf9Cz0kp/playlist.m3u"
           SUCCESS=0
           INDEX=0
 
